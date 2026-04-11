@@ -1,0 +1,23 @@
+# Node / frontend
+node_modules/
+dist/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Deno local cache directories if created by tooling
+.deno/
+
+# Tauri / Rust build artifacts
+src-tauri/target/
+
+# Generated Tauri schema output
+src-tauri/gen/
+
+# Local editor / agent metadata
+.codex/
+.DS_Store
+Thumbs.db
