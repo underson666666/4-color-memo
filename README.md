@@ -9,6 +9,7 @@
 - タブ付きメモ編集
 - 4色の文字色切り替え
 - 太字装飾
+- スクリーンショットの貼り付け
 - Undo / Redo
 - UTF-8 固定保存
 - 改行コードの切り替え
@@ -24,6 +25,7 @@
 - `Ctrl + B`: 青
 - `Ctrl + G`: 緑
 - `Ctrl + Shift + B`: 太字
+- `Ctrl + V`: 画像貼り付け
 - `Ctrl + Tab`: 次のタブ
 - `Ctrl + Shift + Tab`: 前のタブ
 - `Ctrl + N`: 新規タブ
@@ -127,10 +129,12 @@ npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc
 
 ## 保存形式
 
-`.4cm` ファイルはタグ付きテキストとして保存されます。たとえば以下のような形式です。
+`.4cm` ファイルはタグ付きテキストとして保存されます。画像は `.4cm` と同じ階層の `assets/メモ名/` フォルダへ保存し、本文からは相対パスで参照します。
 
 ```txt
-通常の文字<red>赤い文字</red><blue><bold>青の太字</bold></blue>
+通常の文字<red>赤い文字</red>
+<image>assets/meeting/img-20260420-001.png</image>
+<blue><bold>青の太字</bold></blue>
 ```
 
 この形式により、専用アプリ以外で開いても色付き箇所の構造を追えます。

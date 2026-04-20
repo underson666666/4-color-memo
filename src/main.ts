@@ -1,6 +1,7 @@
 import "./styles.css";
 
 import { invoke } from "@tauri-apps/api/core";
+import { basename, dirname, isAbsolute, join } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 
@@ -35,6 +36,40 @@ type FilePayload = {
   newline: NewlineMode;
 };
 
+type BinaryFilePayload = {
+  bytes: number[];
+  mime_type: string;
+};
+
+type TextSegment = {
+  text: string;
+  color: ColorName;
+  bold: boolean;
+};
+
+type TextBlock = {
+  kind: "text";
+  segments: TextSegment[];
+};
+
+type ImageBlock = {
+  kind: "image";
+  src: string;
+};
+
+type DocBlock = TextBlock | ImageBlock;
+
+type EditorSnapshot = {
+  html: string;
+  color: ColorName;
+  bold: boolean;
+};
+
+type TabHistory = {
+  stack: EditorSnapshot[];
+  index: number;
+};
+
 const COLOR_VALUES: Record<ColorName, string> = {
   default: "#202227",
   red: "#ba3b46",
@@ -55,6 +90,7 @@ const SHORTCUT_HINTS = [
   "Ctrl+B: 青",
   "Ctrl+G: 緑",
   "Ctrl+Shift+B: 太字",
+  "Ctrl+V: 画像貼り付け",
   "Ctrl+Tab: 次のタブ",
   "Ctrl+Shift+Tab: 前のタブ",
   "Ctrl+S: 保存",
@@ -65,22 +101,18 @@ const SHORTCUT_HINTS = [
   "Ctrl+Z / Ctrl+Y: Undo / Redo",
 ];
 
-type EditorSnapshot = {
-  html: string;
-  color: ColorName;
-  bold: boolean;
-};
-
-type TabHistory = {
-  stack: EditorSnapshot[];
-  index: number;
-};
+const IMAGE_LOADING_TEXT = "画像を読み込み中...";
+const IMAGE_MISSING_TEXT = "画像が見つかりません";
+const IMAGE_ANCHOR_CLASS = "image-anchor";
 
 let tabs: TabState[] = [];
 let activeTabId: string | null = null;
 let currentTypingColor: ColorName = "default";
 let currentTypingBold = false;
+let selectedImageBlock: HTMLDivElement | null = null;
+let imageHydrationRequestId = 0;
 const histories = new Map<string, TabHistory>();
+const imageUrlCache = new Map<string, string>();
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -143,6 +175,37 @@ const documentWithExec = document as Document & {
   execCommand?: (commandId: string, showUI?: boolean, value?: string) => boolean;
 };
 
+function createEmptyTextBlock(): TextBlock {
+  return {
+    kind: "text",
+    segments: [],
+  };
+}
+
+function cloneDocBlocks(blocks: DocBlock[]): DocBlock[] {
+  return blocks.map((block) =>
+    block.kind === "image"
+      ? { ...block }
+      : {
+          kind: "text",
+          segments: block.segments.map((segment) => ({ ...segment })),
+        },
+  );
+}
+
+function trimTrailingEmptyTextBlocks(blocks: DocBlock[]): DocBlock[] {
+  const trimmed = cloneDocBlocks(blocks);
+  while (trimmed.length > 1) {
+    const last = trimmed.at(-1);
+    if (last?.kind === "text" && last.segments.length === 0) {
+      trimmed.pop();
+      continue;
+    }
+    break;
+  }
+  return trimmed;
+}
+
 function createTab(title = "無題"): TabState {
   return {
     id: crypto.randomUUID(),
@@ -164,18 +227,217 @@ function getSelectionIsCollapsed(): boolean {
 }
 
 function execEditorCommand(command: string, value?: string): void {
+  clearSelectedImageBlock();
   editor.focus();
   documentWithExec.execCommand?.("styleWithCSS", false, "true");
   documentWithExec.execCommand?.(command, false, value);
 }
 
-function getPlainTextFromNode(node: Node, lines: string[], style: { color: ColorName; bold: boolean }): void {
+function appendTextSegment(target: TextSegment[], text: string, style: { color: ColorName; bold: boolean }): void {
+  if (!text) {
+    return;
+  }
+
+  const previous = target.at(-1);
+  if (
+    previous &&
+    previous.color === style.color &&
+    previous.bold === style.bold
+  ) {
+    previous.text += text;
+    return;
+  }
+
+  target.push({
+    text,
+    color: style.color,
+    bold: style.bold,
+  });
+}
+
+function escapeMarkup(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function escapeAttribute(text: string): string {
+  return escapeMarkup(text)
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function decodeEntities(text: string): string {
+  const textarea = document.createElement("textarea");
+  textarea.innerHTML = text;
+  return textarea.value;
+}
+
+function segmentToSpan(text: string, segment: TextSegment): string {
+  let styles = `color: ${COLOR_VALUES[segment.color]};`;
+  if (segment.bold) {
+    styles += " font-weight: 700;";
+  }
+  return `<span style="${styles}">${escapeMarkup(text)}</span>`;
+}
+
+function serializeTextSegmentsToMarkup(segments: TextSegment[]): string {
+  return segments
+    .map((segment) => {
+      let output = escapeMarkup(segment.text);
+      if (segment.bold) {
+        output = `<bold>${output}</bold>`;
+      }
+      if (segment.color !== "default") {
+        output = `<${segment.color}>${output}</${segment.color}>`;
+      }
+      return output;
+    })
+    .join("");
+}
+
+function serializeBlocksToMarkup(blocks: DocBlock[], newline: NewlineMode): string {
+  const lineBreak = newline === "crlf" ? "\r\n" : "\n";
+  return trimTrailingEmptyTextBlocks(blocks)
+    .map((block) => {
+      if (block.kind === "image") {
+        return `<image>${escapeMarkup(block.src)}</image>`;
+      }
+      return serializeTextSegmentsToMarkup(block.segments);
+    })
+    .join(lineBreak);
+}
+
+function deserializeMarkup(markup: string): { blocks: DocBlock[]; newline: NewlineMode } {
+  const newline = markup.includes("\r\n") ? "crlf" : "lf";
+  const normalized = markup.replaceAll("\r\n", "\n");
+  const stack: Array<{ color: ColorName; bold: boolean }> = [{ color: "default", bold: false }];
+  const blocks: DocBlock[] = [];
+  let currentSegments: TextSegment[] = [];
+  let justPushedImage = false;
+  let cursor = 0;
+
+  const flushCurrentTextBlock = (forceEmpty = false): void => {
+    if (currentSegments.length > 0 || forceEmpty) {
+      blocks.push({
+        kind: "text",
+        segments: currentSegments,
+      });
+      currentSegments = [];
+      justPushedImage = false;
+    }
+  };
+
+  const handleLineBreak = (): void => {
+    if (currentSegments.length > 0) {
+      flushCurrentTextBlock();
+      return;
+    }
+    if (justPushedImage) {
+      justPushedImage = false;
+      return;
+    }
+    blocks.push(createEmptyTextBlock());
+  };
+
+  const pushTextChunk = (text: string, style: { color: ColorName; bold: boolean }): void => {
+    const chunks = text.split("\n");
+    chunks.forEach((chunk, index) => {
+      if (chunk) {
+        appendTextSegment(currentSegments, chunk, style);
+        justPushedImage = false;
+      }
+      if (index < chunks.length - 1) {
+        handleLineBreak();
+      }
+    });
+  };
+
+  const pushImageBlock = (src: string): void => {
+    if (currentSegments.length > 0) {
+      flushCurrentTextBlock();
+    }
+    blocks.push({
+      kind: "image",
+      src,
+    });
+    justPushedImage = true;
+  };
+
+  while (cursor < normalized.length) {
+    const tagStart = normalized.indexOf("<", cursor);
+    if (tagStart === -1) {
+      pushTextChunk(decodeEntities(normalized.slice(cursor)), stack.at(-1)!);
+      break;
+    }
+
+    if (tagStart > cursor) {
+      pushTextChunk(decodeEntities(normalized.slice(cursor, tagStart)), stack.at(-1)!);
+    }
+
+    const tagEnd = normalized.indexOf(">", tagStart);
+    if (tagEnd === -1) {
+      pushTextChunk(decodeEntities(normalized.slice(tagStart)), stack.at(-1)!);
+      break;
+    }
+
+    const tag = normalized.slice(tagStart + 1, tagEnd).trim().toLowerCase();
+    const currentStyle = stack.at(-1)!;
+
+    if (tag === "image") {
+      const closeTag = normalized.indexOf("</image>", tagEnd + 1);
+      if (closeTag === -1) {
+        pushTextChunk(decodeEntities(normalized.slice(tagStart)), currentStyle);
+        break;
+      }
+      const rawPath = normalized.slice(tagEnd + 1, closeTag);
+      pushImageBlock(decodeEntities(rawPath).trim());
+      cursor = closeTag + "</image>".length;
+      continue;
+    }
+
+    if (tag === "red" || tag === "blue" || tag === "green" || tag === "bold") {
+      const next = { ...currentStyle };
+      if (tag === "bold") {
+        next.bold = true;
+      } else {
+        next.color = tag;
+      }
+      stack.push(next);
+    } else if (tag === "/red" || tag === "/blue" || tag === "/green" || tag === "/bold") {
+      if (stack.length > 1) {
+        stack.pop();
+      }
+    } else {
+      pushTextChunk(decodeEntities(normalized.slice(tagStart, tagEnd + 1)), currentStyle);
+    }
+
+    cursor = tagEnd + 1;
+  }
+
+  if (currentSegments.length > 0) {
+    flushCurrentTextBlock();
+  }
+
+  const trimmedBlocks = trimTrailingEmptyTextBlocks(blocks);
+  return {
+    blocks: trimmedBlocks.length > 0 ? trimmedBlocks : [createEmptyTextBlock()],
+    newline,
+  };
+}
+
+function isImageBlockElement(element: Element | null): element is HTMLDivElement {
+  return element instanceof HTMLDivElement && element.dataset.docKind === "image";
+}
+
+function collectTextSegmentsFromNode(node: Node, target: TextSegment[], style: { color: ColorName; bold: boolean }): void {
   if (node.nodeType === Node.TEXT_NODE) {
     const value = node.textContent ?? "";
     if (value.length === 0) {
       return;
     }
-    appendStyledText(lines, decodeEntities(value), style);
+    appendTextSegment(target, value, style);
     return;
   }
 
@@ -183,8 +445,7 @@ function getPlainTextFromNode(node: Node, lines: string[], style: { color: Color
     return;
   }
 
-  if (node.tagName === "BR") {
-    appendStyledText(lines, "\n", style);
+  if (isImageBlockElement(node) || node.tagName === "BR") {
     return;
   }
 
@@ -211,206 +472,105 @@ function getPlainTextFromNode(node: Node, lines: string[], style: { color: Color
     nextStyle.bold = true;
   }
 
-  if (node.childNodes.length === 0 && (tag === "div" || tag === "p")) {
-    appendStyledText(lines, "\n", style);
-    return;
-  }
-
-  let emittedBlock = false;
   for (const child of node.childNodes) {
-    getPlainTextFromNode(child, lines, nextStyle);
-    emittedBlock = true;
-  }
-
-  if ((tag === "div" || tag === "p") && emittedBlock) {
-    appendStyledText(lines, "\n", style);
+    collectTextSegmentsFromNode(child, target, nextStyle);
   }
 }
 
-type Segment = {
-  text: string;
-  color: ColorName;
-  bold: boolean;
-};
+function parseTopLevelTextBlock(node: Node): TextBlock {
+  const segments: TextSegment[] = [];
 
-function appendStyledText(target: string[], text: string, style: { color: ColorName; bold: boolean }): void {
-  target.push(JSON.stringify({ text, color: style.color, bold: style.bold }));
-}
-
-function serializeEditorHtmlToSegments(html: string): Segment[] {
-  const container = document.createElement("div");
-  container.innerHTML = html;
-  const raw: string[] = [];
-  for (const child of container.childNodes) {
-    getPlainTextFromNode(child, raw, { color: "default", bold: false });
+  if (node.nodeType === Node.TEXT_NODE) {
+    appendTextSegment(segments, node.textContent ?? "", { color: "default", bold: false });
+    return {
+      kind: "text",
+      segments,
+    };
   }
 
-  const parsed = raw
-    .map((item) => JSON.parse(item) as Segment)
-    .filter((segment) => segment.text.length > 0);
-
-  const merged: Segment[] = [];
-  for (const segment of parsed) {
-    const previous = merged.at(-1);
-    if (
-      previous &&
-      previous.color === segment.color &&
-      previous.bold === segment.bold
-    ) {
-      previous.text += segment.text;
-    } else {
-      merged.push({ ...segment });
-    }
+  if (!(node instanceof HTMLElement)) {
+    return createEmptyTextBlock();
   }
 
-  while (merged.at(-1)?.text.endsWith("\n")) {
-    const last = merged.at(-1);
-    if (!last) {
-      break;
-    }
-    if (last.text === "\n") {
-      merged.pop();
-    } else {
-      last.text = last.text.slice(0, -1);
-    }
+  if (node.classList.contains(IMAGE_ANCHOR_CLASS) && (node.textContent ?? "").trim().length === 0) {
+    return createEmptyTextBlock();
   }
 
-  return merged;
-}
+  if (node.tagName === "BR") {
+    return createEmptyTextBlock();
+  }
 
-function escapeMarkup(text: string): string {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
-}
-
-function decodeEntities(text: string): string {
-  const textarea = document.createElement("textarea");
-  textarea.innerHTML = text;
-  return textarea.value;
-}
-
-function serializeSegmentsToMarkup(segments: Segment[], newline: NewlineMode): string {
-  const lineBreak = newline === "crlf" ? "\r\n" : "\n";
-  return segments
-    .map((segment) => {
-      const text = escapeMarkup(segment.text).replaceAll("\n", lineBreak);
-      let output = text;
-      if (segment.bold) {
-        output = `<bold>${output}</bold>`;
-      }
-      if (segment.color !== "default") {
-        output = `<${segment.color}>${output}</${segment.color}>`;
-      }
-      return output;
-    })
-    .join("");
-}
-
-function deserializeMarkup(markup: string): { html: string; newline: NewlineMode } {
-  const newline = markup.includes("\r\n") ? "crlf" : "lf";
-  const normalized = markup.replaceAll("\r\n", "\n");
-  const stack: Array<{ color: ColorName; bold: boolean }> = [{ color: "default", bold: false }];
-  const segments: Segment[] = [];
-  let cursor = 0;
-
-  while (cursor < normalized.length) {
-    const tagStart = normalized.indexOf("<", cursor);
-    if (tagStart === -1) {
-      pushSegment(segments, decodeEntities(normalized.slice(cursor)), stack.at(-1)!);
-      break;
-    }
-
-    if (tagStart > cursor) {
-      pushSegment(segments, decodeEntities(normalized.slice(cursor, tagStart)), stack.at(-1)!);
-    }
-
-    const tagEnd = normalized.indexOf(">", tagStart);
-    if (tagEnd === -1) {
-      pushSegment(segments, decodeEntities(normalized.slice(tagStart)), stack.at(-1)!);
-      break;
-    }
-
-    const tag = normalized.slice(tagStart + 1, tagEnd).trim().toLowerCase();
-    const current = stack.at(-1)!;
-
-    if (tag === "red" || tag === "blue" || tag === "green" || tag === "bold") {
-      const next = { ...current };
-      if (tag === "bold") {
-        next.bold = true;
-      } else {
-        next.color = tag;
-      }
-      stack.push(next);
-    } else if (tag === "/red" || tag === "/blue" || tag === "/green" || tag === "/bold") {
-      if (stack.length > 1) {
-        stack.pop();
-      }
-    } else {
-      pushSegment(segments, decodeEntities(normalized.slice(tagStart, tagEnd + 1)), current);
-    }
-
-    cursor = tagEnd + 1;
+  for (const child of node.childNodes) {
+    collectTextSegmentsFromNode(child, segments, { color: "default", bold: false });
   }
 
   return {
-    html: segmentsToEditorHtml(segments),
-    newline,
+    kind: "text",
+    segments,
   };
 }
 
-function pushSegment(segments: Segment[], text: string, style: { color: ColorName; bold: boolean }): void {
-  if (!text) {
-    return;
+function editorHtmlToDocBlocks(html: string): DocBlock[] {
+  const container = document.createElement("div");
+  container.innerHTML = html;
+
+  const blocks: DocBlock[] = [];
+  for (const child of container.childNodes) {
+    if (child instanceof HTMLElement && isImageBlockElement(child)) {
+      blocks.push({
+        kind: "image",
+        src: child.dataset.imagePath ?? "",
+      });
+      continue;
+    }
+
+    if (child.nodeType === Node.TEXT_NODE && (child.textContent ?? "").trim().length === 0) {
+      continue;
+    }
+
+    if (
+      child instanceof HTMLElement &&
+      child.classList.contains(IMAGE_ANCHOR_CLASS) &&
+      (child.textContent ?? "").trim().length === 0
+    ) {
+      continue;
+    }
+
+    blocks.push(parseTopLevelTextBlock(child));
   }
-  const previous = segments.at(-1);
-  if (
-    previous &&
-    previous.color === style.color &&
-    previous.bold === style.bold
-  ) {
-    previous.text += text;
-  } else {
-    segments.push({
-      text,
-      color: style.color,
-      bold: style.bold,
-    });
-  }
+
+  const trimmedBlocks = trimTrailingEmptyTextBlocks(blocks);
+  return trimmedBlocks.length > 0 ? trimmedBlocks : [createEmptyTextBlock()];
 }
 
-function segmentsToEditorHtml(segments: Segment[]): string {
-  if (segments.length === 0) {
-    return "<div><br></div>";
-  }
-
-  const lines: string[] = [];
-  let currentLine = "";
-
-  for (const segment of segments) {
-    const chunks = segment.text.split("\n");
-    chunks.forEach((chunk, index) => {
-      if (chunk) {
-        currentLine += segmentToSpan(chunk, segment);
-      }
-      if (index < chunks.length - 1) {
-        lines.push(currentLine || "<br>");
-        currentLine = "";
-      }
-    });
-  }
-
-  lines.push(currentLine || "<br>");
-  return lines.map((line) => `<div>${line}</div>`).join("");
+function createImageBlockHtml(imagePath: string): string {
+  const escapedPath = escapeAttribute(imagePath);
+  const label = escapeMarkup(imagePath);
+  return `
+    <div class="editor-image-block" data-doc-kind="image" data-image-path="${escapedPath}" data-load-state="loading" contenteditable="false" tabindex="0">
+      <div class="editor-image-frame">
+        <img class="memo-image" alt="貼り付け画像" hidden />
+        <div class="editor-image-placeholder">${IMAGE_LOADING_TEXT}</div>
+      </div>
+      <p class="editor-image-caption">${label}</p>
+    </div>
+  `;
 }
 
-function segmentToSpan(text: string, segment: Segment): string {
-  let styles = `color: ${COLOR_VALUES[segment.color]};`;
-  if (segment.bold) {
-    styles += " font-weight: 700;";
-  }
-  return `<span style="${styles}">${escapeMarkup(text)}</span>`;
+function docBlocksToEditorHtml(blocks: DocBlock[]): string {
+  const renderBlocks = trimTrailingEmptyTextBlocks(blocks);
+  const sourceBlocks = renderBlocks.length > 0 ? renderBlocks : [createEmptyTextBlock()];
+  return sourceBlocks
+    .map((block) => {
+      if (block.kind === "image") {
+        return createImageBlockHtml(block.src);
+      }
+      const line = block.segments.length === 0
+        ? "<br>"
+        : block.segments.map((segment) => segmentToSpan(segment.text, segment)).join("");
+      return `<div>${line}</div>`;
+    })
+    .join("");
 }
 
 function toColorName(input: string): ColorName {
@@ -427,6 +587,138 @@ function toColorName(input: string): ColorName {
   return "default";
 }
 
+function createImageBlockElement(imagePath: string): HTMLDivElement {
+  const wrapper = document.createElement("div");
+  wrapper.className = "editor-image-block";
+  wrapper.dataset.docKind = "image";
+  wrapper.dataset.imagePath = imagePath;
+  wrapper.dataset.loadState = "loading";
+  wrapper.contentEditable = "false";
+  wrapper.tabIndex = 0;
+
+  const frame = document.createElement("div");
+  frame.className = "editor-image-frame";
+
+  const img = document.createElement("img");
+  img.className = "memo-image";
+  img.alt = "貼り付け画像";
+  img.hidden = true;
+
+  const placeholder = document.createElement("div");
+  placeholder.className = "editor-image-placeholder";
+  placeholder.textContent = IMAGE_LOADING_TEXT;
+
+  const caption = document.createElement("p");
+  caption.className = "editor-image-caption";
+  caption.textContent = imagePath;
+
+  frame.append(img, placeholder);
+  wrapper.append(frame, caption);
+  return wrapper;
+}
+
+function createEmptyEditorTextBlock(className?: string): HTMLDivElement {
+  const line = document.createElement("div");
+  if (className) {
+    line.className = className;
+  }
+  line.innerHTML = "<br>";
+  return line;
+}
+
+function normalizeImageAnchorBlocks(): void {
+  editor.querySelectorAll<HTMLDivElement>(`.${IMAGE_ANCHOR_CLASS}`).forEach((block) => {
+    if ((block.textContent ?? "").trim().length > 0) {
+      block.classList.remove(IMAGE_ANCHOR_CLASS);
+    }
+  });
+}
+
+function setImageBlockLoading(block: HTMLDivElement, imagePath: string): void {
+  block.dataset.loadState = "loading";
+  block.dataset.imagePath = imagePath;
+
+  const img = block.querySelector<HTMLImageElement>(".memo-image");
+  const placeholder = block.querySelector<HTMLDivElement>(".editor-image-placeholder");
+  const caption = block.querySelector<HTMLParagraphElement>(".editor-image-caption");
+
+  if (img) {
+    img.hidden = true;
+    img.removeAttribute("src");
+  }
+  if (placeholder) {
+    placeholder.hidden = false;
+    placeholder.textContent = IMAGE_LOADING_TEXT;
+  }
+  if (caption) {
+    caption.textContent = imagePath;
+  }
+}
+
+function setImageBlockLoaded(block: HTMLDivElement, src: string, imagePath: string): void {
+  block.dataset.loadState = "loaded";
+  block.dataset.imagePath = imagePath;
+
+  const img = block.querySelector<HTMLImageElement>(".memo-image");
+  const placeholder = block.querySelector<HTMLDivElement>(".editor-image-placeholder");
+  const caption = block.querySelector<HTMLParagraphElement>(".editor-image-caption");
+
+  if (img) {
+    img.src = src;
+    img.hidden = false;
+  }
+  if (placeholder) {
+    placeholder.hidden = true;
+  }
+  if (caption) {
+    caption.textContent = imagePath;
+  }
+}
+
+function setImageBlockMissing(block: HTMLDivElement, imagePath: string): void {
+  block.dataset.loadState = "missing";
+  block.dataset.imagePath = imagePath;
+
+  const img = block.querySelector<HTMLImageElement>(".memo-image");
+  const placeholder = block.querySelector<HTMLDivElement>(".editor-image-placeholder");
+  const caption = block.querySelector<HTMLParagraphElement>(".editor-image-caption");
+
+  if (img) {
+    img.hidden = true;
+    img.removeAttribute("src");
+  }
+  if (placeholder) {
+    placeholder.hidden = false;
+    placeholder.textContent = IMAGE_MISSING_TEXT;
+  }
+  if (caption) {
+    caption.textContent = imagePath;
+  }
+}
+
+function clearSelectedImageBlock(): void {
+  if (!selectedImageBlock) {
+    return;
+  }
+  selectedImageBlock.classList.remove("selected");
+  selectedImageBlock = null;
+}
+
+function selectImageBlock(block: HTMLDivElement): void {
+  if (selectedImageBlock === block) {
+    block.focus();
+    return;
+  }
+  clearSelectedImageBlock();
+  selectedImageBlock = block;
+  selectedImageBlock.classList.add("selected");
+  selectedImageBlock.focus();
+}
+
+function normalizeEditorHtml(html: string): string {
+  return html.trim() ? html : "<div><br></div>";
+}
+
 function renderTabs(): void {
   tabstrip.innerHTML = tabs
     .map((tab) => {
@@ -439,43 +731,6 @@ function renderTabs(): void {
       `;
     })
     .join("");
-}
-
-function setActiveTab(id: string, options?: { preserveCurrent?: boolean }): void {
-  const current = getActiveTab();
-  if (options?.preserveCurrent !== false && current) {
-    current.html = normalizeEditorHtml(editor.innerHTML);
-  }
-
-  activeTabId = id;
-  const next = getActiveTab();
-  if (!next) {
-    return;
-  }
-
-  editor.innerHTML = next.html;
-  newlineSelect.value = next.newline;
-  renderTabs();
-  renderStatus();
-  editor.focus();
-}
-
-function moveTabFocus(direction: 1 | -1): void {
-  if (tabs.length <= 1 || !activeTabId) {
-    return;
-  }
-
-  const currentIndex = tabs.findIndex((tab) => tab.id === activeTabId);
-  if (currentIndex === -1) {
-    return;
-  }
-
-  const nextIndex = (currentIndex + direction + tabs.length) % tabs.length;
-  setActiveTab(tabs[nextIndex].id);
-}
-
-function normalizeEditorHtml(html: string): string {
-  return html.trim() ? html : "<div><br></div>";
 }
 
 function renderStatus(): void {
@@ -494,6 +749,83 @@ function renderStatus(): void {
   document.querySelectorAll<HTMLButtonElement>(".style-btn").forEach((button) => {
     button.classList.toggle("active", currentTypingBold);
   });
+}
+
+function cacheImageObjectUrl(path: string, url: string): void {
+  const existing = imageUrlCache.get(path);
+  if (existing && existing !== url) {
+    URL.revokeObjectURL(existing);
+  }
+  imageUrlCache.set(path, url);
+}
+
+async function getCachedImageObjectUrl(path: string): Promise<string> {
+  const cached = imageUrlCache.get(path);
+  if (cached) {
+    return cached;
+  }
+
+  const payload = await invoke<BinaryFilePayload>("read_binary_file", { path });
+  const blob = new Blob([new Uint8Array(payload.bytes)], {
+    type: payload.mime_type || "application/octet-stream",
+  });
+  const url = URL.createObjectURL(blob);
+  cacheImageObjectUrl(path, url);
+  return url;
+}
+
+async function resolveImageAbsolutePath(documentPath: string | null, imagePath: string): Promise<string | null> {
+  if (!imagePath) {
+    return null;
+  }
+  if (await isAbsolute(imagePath)) {
+    return imagePath;
+  }
+  if (!documentPath) {
+    return null;
+  }
+  const documentDir = await dirname(documentPath);
+  return join(documentDir, imagePath);
+}
+
+async function hydrateEditorImages(): Promise<void> {
+  const active = getActiveTab();
+  if (!active) {
+    return;
+  }
+
+  const requestId = ++imageHydrationRequestId;
+  const imageBlocks = Array.from(editor.querySelectorAll<HTMLDivElement>(".editor-image-block"));
+  for (const block of imageBlocks) {
+    const imagePath = block.dataset.imagePath ?? "";
+    setImageBlockLoading(block, imagePath);
+  }
+
+  for (const block of imageBlocks) {
+    if (requestId !== imageHydrationRequestId) {
+      return;
+    }
+
+    const imagePath = block.dataset.imagePath ?? "";
+    const absolutePath = await resolveImageAbsolutePath(active.path, imagePath);
+    if (!absolutePath) {
+      setImageBlockMissing(block, imagePath);
+      continue;
+    }
+
+    try {
+      const objectUrl = await getCachedImageObjectUrl(absolutePath);
+      if (requestId !== imageHydrationRequestId) {
+        return;
+      }
+      setImageBlockLoaded(block, objectUrl, imagePath);
+    } catch {
+      if (requestId !== imageHydrationRequestId) {
+        return;
+      }
+      setImageBlockMissing(block, imagePath);
+    }
+  }
 }
 
 function ensureHistory(tabId: string): TabHistory {
@@ -534,6 +866,7 @@ function pushHistory(tabId: string, snapshot: EditorSnapshot): void {
 }
 
 function applySnapshot(snapshot: EditorSnapshot): void {
+  clearSelectedImageBlock();
   editor.innerHTML = snapshot.html;
   currentTypingColor = snapshot.color;
   currentTypingBold = snapshot.bold;
@@ -542,6 +875,7 @@ function applySnapshot(snapshot: EditorSnapshot): void {
     active.html = snapshot.html;
   }
   renderStatus();
+  void hydrateEditorImages();
 }
 
 function markDirty(): void {
@@ -549,6 +883,7 @@ function markDirty(): void {
   if (!active) {
     return;
   }
+
   active.html = normalizeEditorHtml(editor.innerHTML);
   active.isDirty = true;
   active.title = active.path ? active.path.split(/[\\/]/).at(-1) ?? active.title : active.title;
@@ -574,7 +909,10 @@ async function persistSession(): Promise<void> {
       id: tab.id,
       title: tab.title,
       path: tab.path,
-      serialized: serializeSegmentsToMarkup(serializeEditorHtmlToSegments(tab.id === activeTabId ? editor.innerHTML : tab.html), tab.newline),
+      serialized: serializeBlocksToMarkup(
+        editorHtmlToDocBlocks(tab.id === activeTabId ? editor.innerHTML : tab.html),
+        tab.newline,
+      ),
       is_dirty: tab.isDirty,
       newline: tab.newline,
     })),
@@ -582,6 +920,41 @@ async function persistSession(): Promise<void> {
   };
 
   await invoke("save_session_state", { session: payload });
+}
+
+function setActiveTab(id: string, options?: { preserveCurrent?: boolean }): void {
+  const current = getActiveTab();
+  if (options?.preserveCurrent !== false && current) {
+    current.html = normalizeEditorHtml(editor.innerHTML);
+  }
+
+  clearSelectedImageBlock();
+  activeTabId = id;
+  const next = getActiveTab();
+  if (!next) {
+    return;
+  }
+
+  editor.innerHTML = next.html;
+  newlineSelect.value = next.newline;
+  renderTabs();
+  renderStatus();
+  editor.focus();
+  void hydrateEditorImages();
+}
+
+function moveTabFocus(direction: 1 | -1): void {
+  if (tabs.length <= 1 || !activeTabId) {
+    return;
+  }
+
+  const currentIndex = tabs.findIndex((tab) => tab.id === activeTabId);
+  if (currentIndex === -1) {
+    return;
+  }
+
+  const nextIndex = (currentIndex + direction + tabs.length) % tabs.length;
+  setActiveTab(tabs[nextIndex].id);
 }
 
 async function restoreSession(): Promise<void> {
@@ -603,15 +976,16 @@ async function restoreSession(): Promise<void> {
 
   tabs = session.tabs.map((tab) => {
     const restored = deserializeMarkup(tab.serialized);
+    const restoredHtml = docBlocksToEditorHtml(restored.blocks);
     histories.set(tab.id, {
-      stack: [{ html: restored.html, color: "default", bold: false }],
+      stack: [{ html: restoredHtml, color: "default", bold: false }],
       index: 0,
     });
     return {
       id: tab.id,
       title: tab.title,
       path: tab.path,
-      html: restored.html,
+      html: restoredHtml,
       isDirty: tab.is_dirty,
       newline: tab.newline ?? restored.newline,
     };
@@ -627,6 +1001,79 @@ async function restoreSession(): Promise<void> {
   }
   renderTabs();
   renderStatus();
+  void hydrateEditorImages();
+}
+
+async function getDocumentFolderName(documentPath: string): Promise<string> {
+  const documentName = await basename(documentPath);
+  return documentName.toLowerCase().endsWith(".4cm")
+    ? documentName.slice(0, -4)
+    : documentName;
+}
+
+async function buildImageStoragePaths(documentPath: string, fileName: string): Promise<{ relativePath: string; absolutePath: string }> {
+  const documentDir = await dirname(documentPath);
+  const documentFolder = await getDocumentFolderName(documentPath);
+  const assetDirectory = await join("assets", documentFolder);
+  return {
+    relativePath: `${assetDirectory}/${fileName}`.replaceAll("\\", "/"),
+    absolutePath: await join(documentDir, assetDirectory, fileName),
+  };
+}
+
+async function remapImageBlocksForSave(blocks: DocBlock[], sourceDocumentPath: string | null, targetDocumentPath: string): Promise<DocBlock[]> {
+  if (!sourceDocumentPath || sourceDocumentPath === targetDocumentPath) {
+    return cloneDocBlocks(blocks);
+  }
+
+  const targetDocumentDir = await dirname(targetDocumentPath);
+  const targetDocumentFolder = await getDocumentFolderName(targetDocumentPath);
+  const targetAssetDirectory = await join("assets", targetDocumentFolder);
+  const remapped = new Map<string, string>();
+
+  const output: DocBlock[] = [];
+  for (const block of blocks) {
+    if (block.kind === "text") {
+      output.push({
+        kind: "text",
+        segments: block.segments.map((segment) => ({ ...segment })),
+      });
+      continue;
+    }
+
+    const existing = remapped.get(block.src);
+    if (existing) {
+      output.push({ kind: "image", src: existing });
+      continue;
+    }
+
+    const fileName = await basename(block.src);
+    const targetRelativePath = `${targetAssetDirectory}/${fileName}`.replaceAll("\\", "/");
+    const targetAbsolutePath = await join(targetDocumentDir, targetAssetDirectory, fileName);
+    const sourceAbsolutePath = await resolveImageAbsolutePath(sourceDocumentPath, block.src);
+
+    let nextSource = targetRelativePath;
+    if (sourceAbsolutePath) {
+      try {
+        await invoke("copy_binary_file", {
+          source: sourceAbsolutePath,
+          target: targetAbsolutePath,
+        });
+      } catch {
+        nextSource = sourceAbsolutePath;
+      }
+    } else {
+      nextSource = block.src;
+    }
+
+    remapped.set(block.src, nextSource);
+    output.push({
+      kind: "image",
+      src: nextSource,
+    });
+  }
+
+  return output;
 }
 
 async function saveCurrentTab(forceSaveAs: boolean): Promise<boolean> {
@@ -638,7 +1085,8 @@ async function saveCurrentTab(forceSaveAs: boolean): Promise<boolean> {
   active.html = normalizeEditorHtml(editor.innerHTML);
   active.newline = newlineSelect.value as NewlineMode;
 
-  let targetPath = active.path;
+  const previousPath = active.path;
+  let targetPath = previousPath;
   if (forceSaveAs || !targetPath) {
     const result = await save({
       title: "4cm ファイルを保存",
@@ -651,15 +1099,26 @@ async function saveCurrentTab(forceSaveAs: boolean): Promise<boolean> {
     targetPath = result;
   }
 
-  const content = serializeSegmentsToMarkup(
-    serializeEditorHtmlToSegments(active.html),
-    active.newline,
-  );
+  const blocks = editorHtmlToDocBlocks(active.html);
+  const blocksForSave = await remapImageBlocksForSave(blocks, previousPath, targetPath);
+  const content = serializeBlocksToMarkup(blocksForSave, active.newline);
   await invoke("write_document", { path: targetPath, content });
 
   active.path = targetPath;
-  active.title = targetPath.split(/[\\/]/).at(-1) ?? active.title;
+  active.title = await basename(targetPath);
   active.isDirty = false;
+
+  if (previousPath !== targetPath) {
+    active.html = docBlocksToEditorHtml(blocksForSave);
+    if (active.id === activeTabId) {
+      clearSelectedImageBlock();
+      editor.innerHTML = active.html;
+      void hydrateEditorImages();
+    }
+  } else {
+    active.html = normalizeEditorHtml(editor.innerHTML);
+  }
+
   renderTabs();
   renderStatus();
   await persistSession();
@@ -681,9 +1140,9 @@ async function openDocument(): Promise<void> {
   const restored = deserializeMarkup(payload.content);
   const tab: TabState = {
     id: crypto.randomUUID(),
-    title: path.split(/[\\/]/).at(-1) ?? "memo.4cm",
+    title: await basename(path),
     path,
-    html: restored.html,
+    html: docBlocksToEditorHtml(restored.blocks),
     isDirty: false,
     newline: payload.newline ?? restored.newline,
   };
@@ -733,6 +1192,7 @@ async function closeTab(tabId: string): Promise<boolean> {
   const nextIndex = Math.max(0, Math.min(closingIndex, tabs.length - 1));
   const nextTabId = tabs[nextIndex]?.id ?? null;
   activeTabId = null;
+  clearSelectedImageBlock();
   if (nextTabId) {
     setActiveTab(nextTabId, { preserveCurrent: false });
   }
@@ -823,6 +1283,174 @@ async function beforeWindowClose(): Promise<boolean> {
   return true;
 }
 
+function findClosestEditorBlock(node: Node | null): HTMLElement | null {
+  let current: Node | null = node;
+  while (current && current !== editor) {
+    if (current instanceof HTMLElement && current.parentElement === editor) {
+      return current;
+    }
+    current = current.parentNode;
+  }
+  return null;
+}
+
+function getCurrentEditorBlock(): HTMLElement | null {
+  const selection = window.getSelection();
+  return findClosestEditorBlock(selection?.anchorNode ?? null);
+}
+
+function isEffectivelyEmptyTextBlock(block: HTMLElement): boolean {
+  if (isImageBlockElement(block)) {
+    return false;
+  }
+  return (block.textContent ?? "").trim().length === 0;
+}
+
+function placeCaretAtTextBlock(block: HTMLElement): void {
+  editor.focus();
+  const range = document.createRange();
+  range.selectNodeContents(block);
+  range.collapse(true);
+  const selection = window.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
+function insertImageBlockAtSelection(imagePath: string, previewUrl: string): void {
+  const imageBlock = createImageBlockElement(imagePath);
+  setImageBlockLoaded(imageBlock, previewUrl, imagePath);
+  const trailingBlock = createEmptyEditorTextBlock(IMAGE_ANCHOR_CLASS);
+  const currentBlock = getCurrentEditorBlock();
+
+  clearSelectedImageBlock();
+
+  if (!currentBlock) {
+    if (editor.innerHTML.trim() === "" || editor.innerHTML === "<div><br></div>") {
+      editor.innerHTML = "";
+    }
+    editor.append(imageBlock, trailingBlock);
+    placeCaretAtTextBlock(trailingBlock);
+    return;
+  }
+
+  if (isImageBlockElement(currentBlock)) {
+    currentBlock.after(imageBlock, trailingBlock);
+    placeCaretAtTextBlock(trailingBlock);
+    return;
+  }
+
+  if (isEffectivelyEmptyTextBlock(currentBlock)) {
+    currentBlock.replaceWith(imageBlock, trailingBlock);
+    placeCaretAtTextBlock(trailingBlock);
+    return;
+  }
+
+  currentBlock.after(imageBlock, trailingBlock);
+  placeCaretAtTextBlock(trailingBlock);
+}
+
+function findNearestTextBlock(start: Element | null, direction: "next" | "previous"): HTMLDivElement | null {
+  let current = start;
+  while (current) {
+    if (current instanceof HTMLDivElement && !isImageBlockElement(current)) {
+      return current;
+    }
+    current = direction === "next" ? current.nextElementSibling : current.previousElementSibling;
+  }
+  return null;
+}
+
+function removeSelectedImageBlock(): void {
+  const block = selectedImageBlock;
+  if (!block) {
+    return;
+  }
+
+  const nextTextBlock = findNearestTextBlock(block.nextElementSibling, "next");
+  const previousTextBlock = findNearestTextBlock(block.previousElementSibling, "previous");
+
+  clearSelectedImageBlock();
+  block.remove();
+
+  let focusTarget = nextTextBlock ?? previousTextBlock;
+  if (!focusTarget) {
+    focusTarget = createEmptyEditorTextBlock();
+    editor.append(focusTarget);
+  }
+
+  placeCaretAtTextBlock(focusTarget);
+  markDirty();
+}
+
+function buildImageFileName(mimeType: string): string {
+  const extension = (() => {
+    switch (mimeType) {
+      case "image/jpeg":
+        return "jpg";
+      case "image/gif":
+        return "gif";
+      case "image/webp":
+        return "webp";
+      case "image/bmp":
+        return "bmp";
+      default:
+        return "png";
+    }
+  })();
+
+  return `img-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
+}
+
+async function ensureImagePasteTarget(): Promise<TabState | null> {
+  const active = getActiveTab();
+  if (!active) {
+    return null;
+  }
+  if (active.path) {
+    return active;
+  }
+
+  const saved = await saveCurrentTab(false);
+  if (!saved) {
+    return null;
+  }
+  return getActiveTab() ?? null;
+}
+
+async function handleEditorPaste(event: ClipboardEvent): Promise<void> {
+  const items = Array.from(event.clipboardData?.items ?? []);
+  const imageItem = items.find((item) => item.type.startsWith("image/"));
+  if (!imageItem) {
+    return;
+  }
+
+  const file = imageItem.getAsFile();
+  if (!file) {
+    return;
+  }
+
+  event.preventDefault();
+
+  const active = await ensureImagePasteTarget();
+  if (!active?.path) {
+    return;
+  }
+
+  const fileName = buildImageFileName(file.type);
+  const storage = await buildImageStoragePaths(active.path, fileName);
+  const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+
+  await invoke("write_binary_file", {
+    path: storage.absolutePath,
+    bytes,
+  });
+
+  const previewUrl = URL.createObjectURL(file);
+  cacheImageObjectUrl(storage.absolutePath, previewUrl);
+  insertImageBlockAtSelection(storage.relativePath, previewUrl);
+  markDirty();
+}
+
 document.querySelectorAll<HTMLButtonElement>(".toolbar button").forEach((button) => {
   button.addEventListener("click", () => {
     const action = button.dataset.action;
@@ -868,7 +1496,35 @@ newlineSelect.addEventListener("change", () => {
 });
 
 editor.addEventListener("input", () => {
+  normalizeImageAnchorBlocks();
+  clearSelectedImageBlock();
   markDirty();
+});
+
+editor.addEventListener("paste", (event) => {
+  void handleEditorPaste(event);
+});
+
+editor.addEventListener("click", (event) => {
+  const target = event.target as HTMLElement;
+  const imageBlock = target.closest<HTMLDivElement>(".editor-image-block");
+  if (imageBlock) {
+    event.preventDefault();
+    selectImageBlock(imageBlock);
+    return;
+  }
+  clearSelectedImageBlock();
+});
+
+document.addEventListener("mousedown", (event) => {
+  const target = event.target;
+  if (!(target instanceof Node)) {
+    clearSelectedImageBlock();
+    return;
+  }
+  if (!editor.contains(target)) {
+    clearSelectedImageBlock();
+  }
 });
 
 function handleShortcut(event: KeyboardEvent): void {
@@ -942,7 +1598,24 @@ function handleShortcut(event: KeyboardEvent): void {
 }
 
 document.addEventListener("keydown", (event) => {
+  if (
+    selectedImageBlock &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.altKey &&
+    (event.key === "Delete" || event.key === "Backspace")
+  ) {
+    event.preventDefault();
+    removeSelectedImageBlock();
+    return;
+  }
   handleShortcut(event);
+});
+
+window.addEventListener("beforeunload", () => {
+  for (const objectUrl of imageUrlCache.values()) {
+    URL.revokeObjectURL(objectUrl);
+  }
 });
 
 async function bootstrap(): Promise<void> {

@@ -30,6 +30,13 @@ struct FilePayload {
     newline: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct BinaryFilePayload {
+    bytes: Vec<u8>,
+    mime_type: String,
+}
+
 struct CloseState {
     approved: Mutex<bool>,
     pending: Mutex<bool>,
@@ -52,6 +59,23 @@ fn detect_newline(content: &str) -> &'static str {
     }
 }
 
+fn detect_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
 #[tauri::command]
 fn read_document(path: String) -> Result<FilePayload, String> {
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
@@ -62,12 +86,42 @@ fn read_document(path: String) -> Result<FilePayload, String> {
 }
 
 #[tauri::command]
+fn read_binary_file(path: String) -> Result<BinaryFilePayload, String> {
+    let path_buf = PathBuf::from(&path);
+    let bytes = fs::read(&path_buf).map_err(|error| error.to_string())?;
+    Ok(BinaryFilePayload {
+        bytes,
+        mime_type: detect_mime_type(&path_buf).to_string(),
+    })
+}
+
+#[tauri::command]
 fn write_document(path: String, content: String) -> Result<(), String> {
     let path_buf = Path::new(&path);
     if let Some(parent) = path_buf.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     fs::write(path_buf, content).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn write_binary_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    let path_buf = Path::new(&path);
+    if let Some(parent) = path_buf.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(path_buf, bytes).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn copy_binary_file(source: String, target: String) -> Result<(), String> {
+    let source_path = Path::new(&source);
+    let target_path = Path::new(&target);
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::copy(source_path, target_path).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -124,7 +178,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             read_document,
+            read_binary_file,
             write_document,
+            write_binary_file,
+            copy_binary_file,
             save_session_state,
             load_session_state,
             approve_window_close,
