@@ -1,6 +1,6 @@
 [package]
 name = "four-color-text"
-version = "0.1.0"
+version = "0.1.1"
 description = "4色ボールペン向けメモエディタ"
 authors = ["Codex"]
 edition = "2021"
