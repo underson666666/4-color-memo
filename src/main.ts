@@ -106,6 +106,7 @@ const IMAGE_MISSING_TEXT = "画像が見つかりません";
 const IMAGE_ANCHOR_CLASS = "image-anchor";
 const DOCUMENT_EXTENSION = "4ct";
 const LEGACY_DOCUMENT_EXTENSION = "4cm";
+const DOCUMENT_EXTENSION_SUFFIX = `.${DOCUMENT_EXTENSION}`;
 
 let tabs: TabState[] = [];
 let activeTabId: string | null = null;
@@ -728,8 +729,12 @@ function normalizeDocumentPath(path: string | null): string | null {
 
   const legacyExtension = `.${LEGACY_DOCUMENT_EXTENSION}`;
   return path.toLowerCase().endsWith(legacyExtension)
-    ? `${path.slice(0, -legacyExtension.length)}.${DOCUMENT_EXTENSION}`
+    ? `${path.slice(0, -legacyExtension.length)}${DOCUMENT_EXTENSION_SUFFIX}`
     : path;
+}
+
+function isSupportedDocumentPath(path: string): boolean {
+  return path.toLowerCase().endsWith(DOCUMENT_EXTENSION_SUFFIX);
 }
 
 function renderTabs(): void {
@@ -1020,9 +1025,8 @@ async function restoreSession(): Promise<void> {
 
 async function getDocumentFolderName(documentPath: string): Promise<string> {
   const documentName = await basename(documentPath);
-  const documentExtension = `.${DOCUMENT_EXTENSION}`;
-  return documentName.toLowerCase().endsWith(documentExtension)
-    ? documentName.slice(0, -documentExtension.length)
+  return documentName.toLowerCase().endsWith(DOCUMENT_EXTENSION_SUFFIX)
+    ? documentName.slice(0, -DOCUMENT_EXTENSION_SUFFIX.length)
     : documentName;
 }
 
@@ -1105,7 +1109,7 @@ async function saveCurrentTab(forceSaveAs: boolean): Promise<boolean> {
   if (forceSaveAs || !targetPath) {
     const result = await save({
       title: "4ct ファイルを保存",
-      defaultPath: active.path ?? `${active.title.replace(/\s+/g, "_") || "memo"}.${DOCUMENT_EXTENSION}`,
+      defaultPath: active.path ?? `${active.title.replace(/\s+/g, "_") || "memo"}${DOCUMENT_EXTENSION_SUFFIX}`,
       filters: [{ name: "4 Color Text", extensions: [DOCUMENT_EXTENSION] }],
     });
     if (!result) {
@@ -1140,17 +1144,7 @@ async function saveCurrentTab(forceSaveAs: boolean): Promise<boolean> {
   return true;
 }
 
-async function openDocument(): Promise<void> {
-  const path = await open({
-    title: "4ct ファイルを開く",
-    multiple: false,
-    filters: [{ name: "4 Color Text", extensions: [DOCUMENT_EXTENSION] }],
-  });
-
-  if (!path || Array.isArray(path)) {
-    return;
-  }
-
+async function openDocumentPath(path: string): Promise<void> {
   const payload = await invoke<FilePayload>("read_document", { path });
   const restored = deserializeMarkup(payload.content);
   const tab: TabState = {
@@ -1168,6 +1162,27 @@ async function openDocument(): Promise<void> {
   });
   setActiveTab(tab.id);
   await persistSession();
+}
+
+async function openDroppedDocuments(paths: string[]): Promise<void> {
+  const documentPaths = paths.filter(isSupportedDocumentPath);
+  for (const path of documentPaths) {
+    await openDocumentPath(path);
+  }
+}
+
+async function openDocument(): Promise<void> {
+  const path = await open({
+    title: "4ct ファイルを開く",
+    multiple: false,
+    filters: [{ name: "4 Color Text", extensions: [DOCUMENT_EXTENSION] }],
+  });
+
+  if (!path || Array.isArray(path)) {
+    return;
+  }
+
+  await openDocumentPath(path);
 }
 
 async function closeTab(tabId: string): Promise<boolean> {
@@ -1634,13 +1649,20 @@ window.addEventListener("beforeunload", () => {
 });
 
 async function bootstrap(): Promise<void> {
-  await getCurrentWindow().listen("app-close-requested", async () => {
+  const currentWindow = getCurrentWindow();
+  await currentWindow.listen("app-close-requested", async () => {
     const ready = await beforeWindowClose();
     if (ready) {
       await invoke("exit_app");
       return;
     }
     await invoke("cancel_window_close");
+  });
+
+  await currentWindow.onDragDropEvent((event) => {
+    if (event.payload.type === "drop") {
+      void openDroppedDocuments(event.payload.paths);
+    }
   });
 
   await restoreSession();
