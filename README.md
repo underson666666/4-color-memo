@@ -26,6 +26,8 @@
 - `Ctrl + G`: 緑
 - `Ctrl + Shift + B`: 太字
 - `Ctrl + V`: 画像貼り付け
+- `Tab`: インデント
+- `Shift + Tab`: アウトデント
 - `Ctrl + Tab`: 次のタブ
 - `Ctrl + Shift + Tab`: 前のタブ
 - `Ctrl + N`: 新規タブ

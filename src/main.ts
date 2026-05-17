@@ -91,6 +91,8 @@ const SHORTCUT_HINTS = [
   "Ctrl+G: 緑",
   "Ctrl+Shift+B: 太字",
   "Ctrl+V: 画像貼り付け",
+  "Tab: インデント",
+  "Shift+Tab: アウトデント",
   "Ctrl+Tab: 次のタブ",
   "Ctrl+Shift+Tab: 前のタブ",
   "Ctrl+S: 保存",
@@ -107,6 +109,7 @@ const IMAGE_ANCHOR_CLASS = "image-anchor";
 const DOCUMENT_EXTENSION = "4ct";
 const LEGACY_DOCUMENT_EXTENSION = "4cm";
 const DOCUMENT_EXTENSION_SUFFIX = `.${DOCUMENT_EXTENSION}`;
+const INDENT_TEXT = "    ";
 
 let tabs: TabState[] = [];
 let activeTabId: string | null = null;
@@ -1329,6 +1332,46 @@ function getCurrentEditorBlock(): HTMLElement | null {
   return findClosestEditorBlock(selection?.anchorNode ?? null);
 }
 
+function getEditorBlockAtBoundary(container: Node, offset: number, edge: "start" | "end"): HTMLElement | null {
+  if (container !== editor) {
+    return findClosestEditorBlock(container);
+  }
+
+  const childIndex = edge === "start" ? offset : offset - 1;
+  const child = editor.children.item(childIndex);
+  return child instanceof HTMLElement ? child : null;
+}
+
+function getSelectedTextBlocks(): HTMLElement[] {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) {
+    const currentBlock = getCurrentEditorBlock();
+    return currentBlock && !isImageBlockElement(currentBlock) ? [currentBlock] : [];
+  }
+
+  const range = selection.getRangeAt(0);
+  const startBlock = getEditorBlockAtBoundary(range.startContainer, range.startOffset, "start");
+  const endBlock = getEditorBlockAtBoundary(range.endContainer, range.endOffset, "end");
+  if (!startBlock || !endBlock) {
+    return [];
+  }
+
+  const editorBlocks = Array.from(editor.children).filter(
+    (child): child is HTMLElement => child instanceof HTMLElement,
+  );
+  const startIndex = editorBlocks.indexOf(startBlock);
+  const endIndex = editorBlocks.indexOf(endBlock);
+  if (startIndex === -1 || endIndex === -1) {
+    return [];
+  }
+
+  const firstIndex = Math.min(startIndex, endIndex);
+  const lastIndex = Math.max(startIndex, endIndex);
+  return editorBlocks
+    .slice(firstIndex, lastIndex + 1)
+    .filter((block) => !isImageBlockElement(block));
+}
+
 function isEffectivelyEmptyTextBlock(block: HTMLElement): boolean {
   if (isImageBlockElement(block)) {
     return false;
@@ -1344,6 +1387,154 @@ function placeCaretAtTextBlock(block: HTMLElement): void {
   const selection = window.getSelection();
   selection?.removeAllRanges();
   selection?.addRange(range);
+}
+
+function getTextOffsetInBlock(block: HTMLElement, container: Node, offset: number): number {
+  const range = document.createRange();
+  range.selectNodeContents(block);
+  try {
+    range.setEnd(container, offset);
+    return range.toString().length;
+  } catch {
+    return 0;
+  } finally {
+    range.detach();
+  }
+}
+
+function placeCaretAtTextOffset(block: HTMLElement, offset: number): void {
+  editor.focus();
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+  let remaining = Math.max(0, offset);
+  let current = walker.nextNode();
+
+  while (current) {
+    const textLength = current.textContent?.length ?? 0;
+    if (remaining <= textLength) {
+      const range = document.createRange();
+      range.setStart(current, remaining);
+      range.collapse(true);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      return;
+    }
+    remaining -= textLength;
+    current = walker.nextNode();
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(block);
+  range.collapse(false);
+  const selection = window.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
+function selectWholeBlocks(blocks: HTMLElement[]): void {
+  const firstBlock = blocks[0];
+  const lastBlock = blocks.at(-1);
+  if (!firstBlock || !lastBlock) {
+    return;
+  }
+
+  editor.focus();
+  const range = document.createRange();
+  range.setStartBefore(firstBlock);
+  range.setEndAfter(lastBlock);
+  const selection = window.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
+function indentBlock(block: HTMLElement): number {
+  block.insertBefore(document.createTextNode(INDENT_TEXT), block.firstChild);
+  return INDENT_TEXT.length;
+}
+
+function outdentBlock(block: HTMLElement): number {
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+  let removed = 0;
+  let current = walker.nextNode() as Text | null;
+
+  while (current && removed < INDENT_TEXT.length) {
+    const text = current.data;
+    if (text.length === 0) {
+      current = walker.nextNode() as Text | null;
+      continue;
+    }
+
+    if (removed === 0 && text.startsWith("\t")) {
+      current.deleteData(0, 1);
+      return 1;
+    }
+
+    const removableSpaces = text.match(/^ +/)?.[0].length ?? 0;
+    if (removableSpaces === 0) {
+      break;
+    }
+
+    const removeCount = Math.min(INDENT_TEXT.length - removed, removableSpaces);
+    current.deleteData(0, removeCount);
+    removed += removeCount;
+
+    if (removeCount < text.length) {
+      break;
+    }
+    current = walker.nextNode() as Text | null;
+  }
+
+  return removed;
+}
+
+function handleIndentShortcut(event: KeyboardEvent): boolean {
+  if (event.key !== "Tab" || event.ctrlKey || event.metaKey || event.altKey) {
+    return false;
+  }
+
+  const selection = window.getSelection();
+  if (!selection?.anchorNode || !editor.contains(selection.anchorNode)) {
+    return false;
+  }
+
+  const blocks = getSelectedTextBlocks();
+  if (blocks.length === 0) {
+    return false;
+  }
+
+  event.preventDefault();
+  clearSelectedImageBlock();
+
+  const isCollapsed = selection.isCollapsed;
+  const currentBlock = isCollapsed ? findClosestEditorBlock(selection.anchorNode) : null;
+  const currentOffset = currentBlock && blocks.includes(currentBlock)
+    ? getTextOffsetInBlock(currentBlock, selection.anchorNode, selection.anchorOffset)
+    : 0;
+
+  let offsetDelta = 0;
+  let changed = false;
+  for (const block of blocks) {
+    const delta = event.shiftKey ? -outdentBlock(block) : indentBlock(block);
+    if (delta !== 0) {
+      changed = true;
+    }
+    if (block === currentBlock) {
+      offsetDelta = delta;
+    }
+  }
+
+  if (!changed) {
+    return true;
+  }
+
+  if (isCollapsed && currentBlock) {
+    placeCaretAtTextOffset(currentBlock, Math.max(0, currentOffset + offsetDelta));
+  } else {
+    selectWholeBlocks(blocks);
+  }
+
+  markDirty();
+  return true;
 }
 
 function insertImageBlockAtSelection(imagePath: string, previewUrl: string): void {
@@ -1628,6 +1819,10 @@ function handleShortcut(event: KeyboardEvent): void {
 }
 
 document.addEventListener("keydown", (event) => {
+  if (handleIndentShortcut(event)) {
+    return;
+  }
+
   if (
     selectedImageBlock &&
     !event.ctrlKey &&
