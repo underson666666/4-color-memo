@@ -36,6 +36,10 @@
 装飾ショートカットは1種類。
 
 - `Ctrl + Shift + B`: 太字
+- `Ctrl + U`: 取り消し線
+- `Ctrl + ;`: `yyyy/mm/dd` 形式の日付を挿入
+- `Ctrl + :`: `hh:mm:ss` 形式の時刻を挿入
+- `Ctrl + ?`: ショートカットキー一覧の表示 / 非表示
 - `Ctrl + V`: 画像貼り付け
 - `Tab`: インデント
 - `Shift + Tab`: アウトデント
@@ -71,6 +75,7 @@
 - `<blue>...</blue>`
 - `<green>...</green>`
 - `<bold>...</bold>`
+- `<strike>...</strike>`
 - `<image>...</image>`
 
 例:
@@ -79,6 +84,7 @@
 通常の文字<red>赤い文字</red>
 <image>assets/meeting/img-20260420-001.png</image>
 <blue><bold>青の太字</bold></blue>
+<strike>取り消し線</strike>
 ```
 
 画像ファイル本体は `.4ct` ファイルと同じ階層の `assets/メモ名/` フォルダへ保存し、本文からは相対パスで参照する。

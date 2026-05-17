@@ -45,6 +45,7 @@ type TextSegment = {
   text: string;
   color: ColorName;
   bold: boolean;
+  strike: boolean;
 };
 
 type TextBlock = {
@@ -63,6 +64,7 @@ type EditorSnapshot = {
   html: string;
   color: ColorName;
   bold: boolean;
+  strike: boolean;
 };
 
 type TabHistory = {
@@ -90,6 +92,10 @@ const SHORTCUT_HINTS = [
   "Ctrl+B: 青",
   "Ctrl+G: 緑",
   "Ctrl+Shift+B: 太字",
+  "Ctrl+U: 取り消し線",
+  "Ctrl + ;: 日付を挿入",
+  "Ctrl + :: 時刻を挿入",
+  "Ctrl + ?: ショートカット一覧の表示切替",
   "Ctrl+V: 画像貼り付け",
   "Tab: インデント",
   "Shift+Tab: アウトデント",
@@ -115,6 +121,8 @@ let tabs: TabState[] = [];
 let activeTabId: string | null = null;
 let currentTypingColor: ColorName = "default";
 let currentTypingBold = false;
+let currentTypingStrike = false;
+let shortcutSidebarVisible = true;
 let selectedImageBlock: HTMLDivElement | null = null;
 let imageHydrationRequestId = 0;
 const histories = new Map<string, TabHistory>();
@@ -172,6 +180,7 @@ app.innerHTML = `
 `;
 
 const editor = document.querySelector<HTMLDivElement>("#editor")!;
+const workspace = document.querySelector<HTMLElement>(".workspace")!;
 const tabstrip = document.querySelector<HTMLElement>(".tabstrip")!;
 const newlineSelect = document.querySelector<HTMLSelectElement>("#newline-mode")!;
 const statusPath = document.querySelector<HTMLSpanElement>("#status-path")!;
@@ -239,7 +248,7 @@ function execEditorCommand(command: string, value?: string): void {
   documentWithExec.execCommand?.(command, false, value);
 }
 
-function appendTextSegment(target: TextSegment[], text: string, style: { color: ColorName; bold: boolean }): void {
+function appendTextSegment(target: TextSegment[], text: string, style: { color: ColorName; bold: boolean; strike: boolean }): void {
   if (!text) {
     return;
   }
@@ -248,7 +257,8 @@ function appendTextSegment(target: TextSegment[], text: string, style: { color: 
   if (
     previous &&
     previous.color === style.color &&
-    previous.bold === style.bold
+    previous.bold === style.bold &&
+    previous.strike === style.strike
   ) {
     previous.text += text;
     return;
@@ -258,6 +268,7 @@ function appendTextSegment(target: TextSegment[], text: string, style: { color: 
     text,
     color: style.color,
     bold: style.bold,
+    strike: style.strike,
   });
 }
 
@@ -285,6 +296,9 @@ function segmentToSpan(text: string, segment: TextSegment): string {
   if (segment.bold) {
     styles += " font-weight: 700;";
   }
+  if (segment.strike) {
+    styles += " text-decoration: line-through;";
+  }
   return `<span style="${styles}">${escapeMarkup(text)}</span>`;
 }
 
@@ -294,6 +308,9 @@ function serializeTextSegmentsToMarkup(segments: TextSegment[]): string {
       let output = escapeMarkup(segment.text);
       if (segment.bold) {
         output = `<bold>${output}</bold>`;
+      }
+      if (segment.strike) {
+        output = `<strike>${output}</strike>`;
       }
       if (segment.color !== "default") {
         output = `<${segment.color}>${output}</${segment.color}>`;
@@ -318,7 +335,7 @@ function serializeBlocksToMarkup(blocks: DocBlock[], newline: NewlineMode): stri
 function deserializeMarkup(markup: string): { blocks: DocBlock[]; newline: NewlineMode } {
   const newline = markup.includes("\r\n") ? "crlf" : "lf";
   const normalized = markup.replaceAll("\r\n", "\n");
-  const stack: Array<{ color: ColorName; bold: boolean }> = [{ color: "default", bold: false }];
+  const stack: Array<{ color: ColorName; bold: boolean; strike: boolean }> = [{ color: "default", bold: false, strike: false }];
   const blocks: DocBlock[] = [];
   let currentSegments: TextSegment[] = [];
   let justPushedImage = false;
@@ -347,7 +364,7 @@ function deserializeMarkup(markup: string): { blocks: DocBlock[]; newline: Newli
     blocks.push(createEmptyTextBlock());
   };
 
-  const pushTextChunk = (text: string, style: { color: ColorName; bold: boolean }): void => {
+  const pushTextChunk = (text: string, style: { color: ColorName; bold: boolean; strike: boolean }): void => {
     const chunks = text.split("\n");
     chunks.forEach((chunk, index) => {
       if (chunk) {
@@ -403,15 +420,17 @@ function deserializeMarkup(markup: string): { blocks: DocBlock[]; newline: Newli
       continue;
     }
 
-    if (tag === "red" || tag === "blue" || tag === "green" || tag === "bold") {
+    if (tag === "red" || tag === "blue" || tag === "green" || tag === "bold" || tag === "strike") {
       const next = { ...currentStyle };
       if (tag === "bold") {
         next.bold = true;
+      } else if (tag === "strike") {
+        next.strike = true;
       } else {
         next.color = tag;
       }
       stack.push(next);
-    } else if (tag === "/red" || tag === "/blue" || tag === "/green" || tag === "/bold") {
+    } else if (tag === "/red" || tag === "/blue" || tag === "/green" || tag === "/bold" || tag === "/strike") {
       if (stack.length > 1) {
         stack.pop();
       }
@@ -437,7 +456,7 @@ function isImageBlockElement(element: Element | null): element is HTMLDivElement
   return element instanceof HTMLDivElement && element.dataset.docKind === "image";
 }
 
-function collectTextSegmentsFromNode(node: Node, target: TextSegment[], style: { color: ColorName; bold: boolean }): void {
+function collectTextSegmentsFromNode(node: Node, target: TextSegment[], style: { color: ColorName; bold: boolean; strike: boolean }): void {
   if (node.nodeType === Node.TEXT_NODE) {
     const value = node.textContent ?? "";
     if (value.length === 0) {
@@ -462,6 +481,10 @@ function collectTextSegmentsFromNode(node: Node, target: TextSegment[], style: {
     nextStyle.bold = true;
   }
 
+  if (tag === "s" || tag === "strike" || tag === "del") {
+    nextStyle.strike = true;
+  }
+
   if (tag === "font") {
     const color = node.getAttribute("color");
     if (color) {
@@ -478,6 +501,10 @@ function collectTextSegmentsFromNode(node: Node, target: TextSegment[], style: {
     nextStyle.bold = true;
   }
 
+  if (node.style.textDecorationLine.includes("line-through") || node.style.textDecoration.includes("line-through")) {
+    nextStyle.strike = true;
+  }
+
   for (const child of node.childNodes) {
     collectTextSegmentsFromNode(child, target, nextStyle);
   }
@@ -487,7 +514,7 @@ function parseTopLevelTextBlock(node: Node): TextBlock {
   const segments: TextSegment[] = [];
 
   if (node.nodeType === Node.TEXT_NODE) {
-    appendTextSegment(segments, node.textContent ?? "", { color: "default", bold: false });
+    appendTextSegment(segments, node.textContent ?? "", { color: "default", bold: false, strike: false });
     return {
       kind: "text",
       segments,
@@ -507,7 +534,7 @@ function parseTopLevelTextBlock(node: Node): TextBlock {
   }
 
   for (const child of node.childNodes) {
-    collectTextSegmentsFromNode(child, segments, { color: "default", bold: false });
+    collectTextSegmentsFromNode(child, segments, { color: "default", bold: false, strike: false });
   }
 
   return {
@@ -762,6 +789,8 @@ function renderStatus(): void {
   statusPath.textContent = active.path ?? "未保存ファイル";
   statusStyle.textContent = `入力色: ${COLOR_LABELS[currentTypingColor]} / 太字: ${
     currentTypingBold ? "ON" : "OFF"
+  } / 取り消し線: ${
+    currentTypingStrike ? "ON" : "OFF"
   }`;
 
   document.querySelectorAll<HTMLButtonElement>(".color-btn").forEach((button) => {
@@ -858,6 +887,7 @@ function ensureHistory(tabId: string): TabHistory {
     html: "<div><br></div>",
     color: "default",
     bold: false,
+    strike: false,
   };
   const history = { stack: [initial], index: 0 };
   histories.set(tabId, history);
@@ -871,7 +901,8 @@ function pushHistory(tabId: string, snapshot: EditorSnapshot): void {
     current &&
     current.html === snapshot.html &&
     current.color === snapshot.color &&
-    current.bold === snapshot.bold
+    current.bold === snapshot.bold &&
+    current.strike === snapshot.strike
   ) {
     return;
   }
@@ -891,6 +922,7 @@ function applySnapshot(snapshot: EditorSnapshot): void {
   editor.innerHTML = snapshot.html;
   currentTypingColor = snapshot.color;
   currentTypingBold = snapshot.bold;
+  currentTypingStrike = snapshot.strike;
   const active = getActiveTab();
   if (active) {
     active.html = snapshot.html;
@@ -912,6 +944,7 @@ function markDirty(): void {
     html: active.html,
     color: currentTypingColor,
     bold: currentTypingBold,
+    strike: currentTypingStrike,
   });
   renderTabs();
   renderStatus();
@@ -985,7 +1018,7 @@ async function restoreSession(): Promise<void> {
     tabs = [initial];
     activeTabId = initial.id;
     histories.set(initial.id, {
-      stack: [{ html: initial.html, color: "default", bold: false }],
+      stack: [{ html: initial.html, color: "default", bold: false, strike: false }],
       index: 0,
     });
     editor.innerHTML = initial.html;
@@ -1000,7 +1033,7 @@ async function restoreSession(): Promise<void> {
     const restored = deserializeMarkup(tab.serialized);
     const restoredHtml = docBlocksToEditorHtml(restored.blocks);
     histories.set(tab.id, {
-      stack: [{ html: restoredHtml, color: "default", bold: false }],
+      stack: [{ html: restoredHtml, color: "default", bold: false, strike: false }],
       index: 0,
     });
     return {
@@ -1160,7 +1193,7 @@ async function openDocumentPath(path: string): Promise<void> {
   };
   tabs.push(tab);
   histories.set(tab.id, {
-    stack: [{ html: tab.html, color: "default", bold: false }],
+    stack: [{ html: tab.html, color: "default", bold: false, strike: false }],
     index: 0,
   });
   setActiveTab(tab.id);
@@ -1217,7 +1250,7 @@ async function closeTab(tabId: string): Promise<boolean> {
     const replacement = createTab();
     tabs.push(replacement);
     histories.set(replacement.id, {
-      stack: [{ html: replacement.html, color: "default", bold: false }],
+      stack: [{ html: replacement.html, color: "default", bold: false, strike: false }],
       index: 0,
     });
   }
@@ -1251,6 +1284,41 @@ function toggleBold(): void {
     markDirty();
   }
   renderStatus();
+}
+
+function toggleStrike(): void {
+  currentTypingStrike = !currentTypingStrike;
+  execEditorCommand("strikeThrough");
+  if (!getSelectionIsCollapsed()) {
+    markDirty();
+  }
+  renderStatus();
+}
+
+function padDatePart(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function formatCurrentDate(): string {
+  const now = new Date();
+  return `${now.getFullYear()}/${padDatePart(now.getMonth() + 1)}/${padDatePart(now.getDate())}`;
+}
+
+function formatCurrentTime(): string {
+  const now = new Date();
+  return `${padDatePart(now.getHours())}:${padDatePart(now.getMinutes())}:${padDatePart(now.getSeconds())}`;
+}
+
+function insertTextAtSelection(text: string): void {
+  clearSelectedImageBlock();
+  editor.focus();
+  documentWithExec.execCommand?.("insertText", false, text);
+  markDirty();
+}
+
+function toggleShortcutSidebar(): void {
+  shortcutSidebarVisible = !shortcutSidebarVisible;
+  workspace.classList.toggle("shortcuts-hidden", !shortcutSidebarVisible);
 }
 
 function undo(): void {
@@ -1287,7 +1355,7 @@ function createNewTab(): void {
   const tab = createTab();
   tabs.push(tab);
   histories.set(tab.id, {
-    stack: [{ html: tab.html, color: "default", bold: false }],
+    stack: [{ html: tab.html, color: "default", bold: false, strike: false }],
     index: 0,
   });
   setActiveTab(tab.id);
@@ -1754,6 +1822,8 @@ function handleShortcut(event: KeyboardEvent): void {
   }
 
   const key = event.key.toLowerCase();
+  const isTimeShortcut = key === ":" || (event.shiftKey && event.code === "Semicolon");
+  const isShortcutToggle = key === "?" || (event.shiftKey && event.code === "Slash");
 
   if (key === "s") {
     event.preventDefault();
@@ -1790,6 +1860,26 @@ function handleShortcut(event: KeyboardEvent): void {
   if (key === "y") {
     event.preventDefault();
     redo();
+    return;
+  }
+  if (key === "u") {
+    event.preventDefault();
+    toggleStrike();
+    return;
+  }
+  if (isTimeShortcut) {
+    event.preventDefault();
+    insertTextAtSelection(formatCurrentTime());
+    return;
+  }
+  if (key === ";" && !event.shiftKey) {
+    event.preventDefault();
+    insertTextAtSelection(formatCurrentDate());
+    return;
+  }
+  if (isShortcutToggle) {
+    event.preventDefault();
+    toggleShortcutSidebar();
     return;
   }
   if (key === "d") {

@@ -25,6 +25,10 @@
 - `Ctrl + B`: 青
 - `Ctrl + G`: 緑
 - `Ctrl + Shift + B`: 太字
+- `Ctrl + U`: 取り消し線
+- `Ctrl + ;`: `yyyy/mm/dd` 形式の日付を挿入
+- `Ctrl + :`: `hh:mm:ss` 形式の時刻を挿入
+- `Ctrl + ?`: ショートカットキー一覧の表示 / 非表示
 - `Ctrl + V`: 画像貼り付け
 - `Tab`: インデント
 - `Shift + Tab`: アウトデント
@@ -137,6 +141,7 @@ npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc
 通常の文字<red>赤い文字</red>
 <image>assets/meeting/img-20260420-001.png</image>
 <blue><bold>青の太字</bold></blue>
+<strike>取り消し線</strike>
 ```
 
 この形式により、専用アプリ以外で開いても色付き箇所の構造を追えます。

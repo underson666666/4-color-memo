@@ -145,6 +145,10 @@ h2 {
   min-height: 0;
 }
 
+.workspace.shortcuts-hidden {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .editor {
   overflow: auto;
   border-radius: 24px;
@@ -231,6 +235,10 @@ h2 {
 .sidebar {
   border-radius: 24px;
   padding: 18px;
+}
+
+.workspace.shortcuts-hidden .sidebar {
+  display: none;
 }
 
 .shortcut-list {
