@@ -104,6 +104,8 @@ const SHORTCUT_HINTS = [
 const IMAGE_LOADING_TEXT = "画像を読み込み中...";
 const IMAGE_MISSING_TEXT = "画像が見つかりません";
 const IMAGE_ANCHOR_CLASS = "image-anchor";
+const DOCUMENT_EXTENSION = "4ct";
+const LEGACY_DOCUMENT_EXTENSION = "4cm";
 
 let tabs: TabState[] = [];
 let activeTabId: string | null = null;
@@ -719,6 +721,17 @@ function normalizeEditorHtml(html: string): string {
   return html.trim() ? html : "<div><br></div>";
 }
 
+function normalizeDocumentPath(path: string | null): string | null {
+  if (!path) {
+    return null;
+  }
+
+  const legacyExtension = `.${LEGACY_DOCUMENT_EXTENSION}`;
+  return path.toLowerCase().endsWith(legacyExtension)
+    ? `${path.slice(0, -legacyExtension.length)}.${DOCUMENT_EXTENSION}`
+    : path;
+}
+
 function renderTabs(): void {
   tabstrip.innerHTML = tabs
     .map((tab) => {
@@ -975,6 +988,7 @@ async function restoreSession(): Promise<void> {
   }
 
   tabs = session.tabs.map((tab) => {
+    const normalizedPath = normalizeDocumentPath(tab.path);
     const restored = deserializeMarkup(tab.serialized);
     const restoredHtml = docBlocksToEditorHtml(restored.blocks);
     histories.set(tab.id, {
@@ -983,8 +997,8 @@ async function restoreSession(): Promise<void> {
     });
     return {
       id: tab.id,
-      title: tab.title,
-      path: tab.path,
+      title: normalizedPath ? normalizedPath.split(/[\\/]/).at(-1) ?? tab.title : tab.title,
+      path: normalizedPath,
       html: restoredHtml,
       isDirty: tab.is_dirty,
       newline: tab.newline ?? restored.newline,
@@ -1006,8 +1020,9 @@ async function restoreSession(): Promise<void> {
 
 async function getDocumentFolderName(documentPath: string): Promise<string> {
   const documentName = await basename(documentPath);
-  return documentName.toLowerCase().endsWith(".4cm")
-    ? documentName.slice(0, -4)
+  const documentExtension = `.${DOCUMENT_EXTENSION}`;
+  return documentName.toLowerCase().endsWith(documentExtension)
+    ? documentName.slice(0, -documentExtension.length)
     : documentName;
 }
 
@@ -1089,9 +1104,9 @@ async function saveCurrentTab(forceSaveAs: boolean): Promise<boolean> {
   let targetPath = previousPath;
   if (forceSaveAs || !targetPath) {
     const result = await save({
-      title: "4cm ファイルを保存",
-      defaultPath: active.path ?? `${active.title.replace(/\s+/g, "_") || "memo"}.4cm`,
-      filters: [{ name: "4 Color Memo", extensions: ["4cm"] }],
+      title: "4ct ファイルを保存",
+      defaultPath: active.path ?? `${active.title.replace(/\s+/g, "_") || "memo"}.${DOCUMENT_EXTENSION}`,
+      filters: [{ name: "4 Color Text", extensions: [DOCUMENT_EXTENSION] }],
     });
     if (!result) {
       return false;
@@ -1127,9 +1142,9 @@ async function saveCurrentTab(forceSaveAs: boolean): Promise<boolean> {
 
 async function openDocument(): Promise<void> {
   const path = await open({
-    title: "4cm ファイルを開く",
+    title: "4ct ファイルを開く",
     multiple: false,
-    filters: [{ name: "4 Color Memo", extensions: ["4cm"] }],
+    filters: [{ name: "4 Color Text", extensions: [DOCUMENT_EXTENSION] }],
   });
 
   if (!path || Array.isArray(path)) {

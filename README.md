@@ -2,7 +2,7 @@
 
 4色ボールペンの色分けメモをテキストとして扱うための、Tauri ベースのデスクトップエディタです。
 
-保存形式は独自拡張子 `.4cm` です。色や太字の情報は `<red>...</red>` や `<bold>...</bold>` のようなタグ付きテキストとして保存されるため、通常のテキストエディタで開いても内容を確認できます。
+保存形式は独自拡張子 `.4ct` です。色や太字の情報は `<red>...</red>` や `<bold>...</bold>` のようなタグ付きテキストとして保存されるため、通常のテキストエディタで開いても内容を確認できます。
 
 ## 主な機能
 
@@ -14,7 +14,7 @@
 - UTF-8 固定保存
 - 改行コードの切り替え
   - デフォルトは `CRLF`
-- `.4cm` ファイルの保存 / 読み込み
+- `.4ct` ファイルの保存 / 読み込み
 - セッション保存
   - 開いていたタブ構成を次回起動時に復元
 
@@ -124,12 +124,12 @@ npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc
 
 生成物:
 
-- `src-tauri/target/x86_64-pc-windows-msvc/release/four-color-text.exe`
+- `src-tauri/target/x86_64-pc-windows-msvc/release/4coloreditor.exe`
 - `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/4 Color Text_0.1.0_x64-setup.exe`
 
 ## 保存形式
 
-`.4cm` ファイルはタグ付きテキストとして保存されます。画像は `.4cm` と同じ階層の `assets/メモ名/` フォルダへ保存し、本文からは相対パスで参照します。
+`.4ct` ファイルはタグ付きテキストとして保存されます。画像は `.4ct` と同じ階層の `assets/メモ名/` フォルダへ保存し、本文からは相対パスで参照します。
 
 ```txt
 通常の文字<red>赤い文字</red>
