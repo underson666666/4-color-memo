@@ -122,7 +122,7 @@ let activeTabId: string | null = null;
 let currentTypingColor: ColorName = "default";
 let currentTypingBold = false;
 let currentTypingStrike = false;
-let shortcutSidebarVisible = true;
+let shortcutModalOpen = false;
 let selectedImageBlock: HTMLDivElement | null = null;
 let imageHydrationRequestId = 0;
 const histories = new Map<string, TabHistory>();
@@ -137,54 +137,70 @@ if (!app) {
 app.innerHTML = `
   <div class="shell">
     <header class="topbar">
-      <div>
-        <p class="eyebrow">4 color memo editor</p>
-        <h1>4 Color Text</h1>
-      </div>
       <div class="toolbar">
         <button type="button" data-action="new">新規</button>
         <button type="button" data-action="open">開く</button>
         <button type="button" data-action="save">保存</button>
         <button type="button" data-action="saveAs">名前を付けて保存</button>
       </div>
+      <div class="formatbar">
+        <button type="button" class="color-btn" data-color="default">黒</button>
+        <button type="button" class="color-btn color-red" data-color="red">赤</button>
+        <button type="button" class="color-btn color-blue" data-color="blue">青</button>
+        <button type="button" class="color-btn color-green" data-color="green">緑</button>
+        <button type="button" class="style-btn" data-style="bold">太字</button>
+        <button type="button" class="style-btn" data-style="strike">取り消し線</button>
+      </div>
     </header>
-    <section class="formatbar">
-      <button type="button" class="color-btn" data-color="default">黒</button>
-      <button type="button" class="color-btn color-red" data-color="red">赤</button>
-      <button type="button" class="color-btn color-blue" data-color="blue">青</button>
-      <button type="button" class="color-btn color-green" data-color="green">緑</button>
-      <button type="button" class="style-btn" data-style="bold">太字</button>
-      <label class="newline-select">
-        改行
-        <select id="newline-mode">
-          <option value="lf">LF</option>
-          <option value="crlf">CRLF</option>
-        </select>
-      </label>
-    </section>
     <section class="tabstrip"></section>
     <main class="workspace">
       <div id="editor" class="editor" contenteditable="true" spellcheck="false"></div>
-      <aside class="sidebar">
-        <h2>ショートカット</h2>
+    </main>
+    <footer class="statusbar">
+      <div class="status-main">
+        <strong id="status-color" class="status-color">黒</strong>
+        <span class="status-separator">|</span>
+        <span class="status-item">太字 <strong id="status-bold">OFF</strong></span>
+        <span class="status-separator">|</span>
+        <span class="status-item">取り消し線 <strong id="status-strike">OFF</strong></span>
+      </div>
+      <div class="status-actions">
+        <button type="button" id="newline-mode" class="status-button">CRLF</button>
+        <span class="status-separator">|</span>
+        <button type="button" id="status-path" class="path-button">コピー</button>
+        <span class="status-separator">|</span>
+        <button type="button" id="shortcut-toggle" class="help-button" aria-label="ショートカットキー一覧">?</button>
+      </div>
+    </footer>
+    <div id="path-menu" class="context-menu" hidden>
+      <button type="button" data-copy="name">ファイル名をコピー</button>
+      <button type="button" data-copy="path">絶対パスをコピー</button>
+    </div>
+    <div id="shortcut-modal" class="modal-backdrop" hidden>
+      <section class="shortcut-modal" role="dialog" aria-modal="true" aria-labelledby="shortcut-title">
+        <header class="modal-header">
+          <h2 id="shortcut-title">ショートカットキー</h2>
+          <button type="button" id="shortcut-close" class="modal-close" aria-label="閉じる">×</button>
+        </header>
         <ul class="shortcut-list">
           ${SHORTCUT_HINTS.map((hint) => `<li>${hint}</li>`).join("")}
         </ul>
-      </aside>
-    </main>
-    <footer class="statusbar">
-      <span id="status-path">未保存ファイル</span>
-      <span id="status-style">入力色: 黒 / 太字: OFF</span>
-    </footer>
+      </section>
+    </div>
   </div>
 `;
 
 const editor = document.querySelector<HTMLDivElement>("#editor")!;
-const workspace = document.querySelector<HTMLElement>(".workspace")!;
 const tabstrip = document.querySelector<HTMLElement>(".tabstrip")!;
-const newlineSelect = document.querySelector<HTMLSelectElement>("#newline-mode")!;
-const statusPath = document.querySelector<HTMLSpanElement>("#status-path")!;
-const statusStyle = document.querySelector<HTMLSpanElement>("#status-style")!;
+const newlineButton = document.querySelector<HTMLButtonElement>("#newline-mode")!;
+const statusPath = document.querySelector<HTMLButtonElement>("#status-path")!;
+const statusColor = document.querySelector<HTMLElement>("#status-color")!;
+const statusBold = document.querySelector<HTMLElement>("#status-bold")!;
+const statusStrike = document.querySelector<HTMLElement>("#status-strike")!;
+const shortcutToggle = document.querySelector<HTMLButtonElement>("#shortcut-toggle")!;
+const shortcutModal = document.querySelector<HTMLDivElement>("#shortcut-modal")!;
+const shortcutClose = document.querySelector<HTMLButtonElement>("#shortcut-close")!;
+const pathMenu = document.querySelector<HTMLDivElement>("#path-menu")!;
 
 const documentWithExec = document as Document & {
   execCommand?: (commandId: string, showUI?: boolean, value?: string) => boolean;
@@ -767,6 +783,54 @@ function isSupportedDocumentPath(path: string): boolean {
   return path.toLowerCase().endsWith(DOCUMENT_EXTENSION_SUFFIX);
 }
 
+function getFileNameFromPath(path: string): string {
+  return path.split(/[\\/]/).at(-1) ?? path;
+}
+
+function closePathMenu(): void {
+  pathMenu.hidden = true;
+}
+
+function openPathMenu(x: number, y: number): void {
+  const active = getActiveTab();
+  if (!active?.path) {
+    return;
+  }
+
+  pathMenu.style.left = "0";
+  pathMenu.style.top = "0";
+  pathMenu.hidden = false;
+  const menuRect = pathMenu.getBoundingClientRect();
+  const margin = 8;
+  const left = Math.min(x, window.innerWidth - menuRect.width - margin);
+  const top = Math.max(margin, y - menuRect.height - margin);
+  pathMenu.style.left = `${Math.max(margin, left)}px`;
+  pathMenu.style.top = `${top}px`;
+}
+
+async function writeClipboardText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.append(textarea);
+    textarea.select();
+    documentWithExec.execCommand?.("copy");
+    textarea.remove();
+  }
+}
+
+function closeFloatingUi(): void {
+  closePathMenu();
+  if (shortcutModalOpen) {
+    setShortcutModalOpen(false);
+  }
+}
+
 function renderTabs(): void {
   tabstrip.innerHTML = tabs
     .map((tab) => {
@@ -786,18 +850,26 @@ function renderStatus(): void {
   if (!active) {
     return;
   }
-  statusPath.textContent = active.path ?? "未保存ファイル";
-  statusStyle.textContent = `入力色: ${COLOR_LABELS[currentTypingColor]} / 太字: ${
-    currentTypingBold ? "ON" : "OFF"
-  } / 取り消し線: ${
-    currentTypingStrike ? "ON" : "OFF"
-  }`;
+  statusColor.textContent = COLOR_LABELS[currentTypingColor];
+  statusBold.textContent = currentTypingBold ? "ON" : "OFF";
+  statusStrike.textContent = currentTypingStrike ? "ON" : "OFF";
+  statusBold.dataset.active = String(currentTypingBold);
+  statusStrike.dataset.active = String(currentTypingStrike);
+  newlineButton.textContent = active.newline.toUpperCase();
+  newlineButton.dataset.newline = active.newline;
+  statusPath.textContent = active.path ? "コピー" : "未保存";
+  statusPath.title = active.path ?? "未保存ファイル";
+  statusPath.disabled = !active.path;
 
   document.querySelectorAll<HTMLButtonElement>(".color-btn").forEach((button) => {
     button.classList.toggle("active", button.dataset.color === currentTypingColor);
   });
   document.querySelectorAll<HTMLButtonElement>(".style-btn").forEach((button) => {
-    button.classList.toggle("active", currentTypingBold);
+    const style = button.dataset.style;
+    button.classList.toggle(
+      "active",
+      (style === "bold" && currentTypingBold) || (style === "strike" && currentTypingStrike),
+    );
   });
 }
 
@@ -955,7 +1027,6 @@ async function persistSession(): Promise<void> {
   const active = getActiveTab();
   if (active) {
     active.html = normalizeEditorHtml(editor.innerHTML);
-    active.newline = newlineSelect.value as NewlineMode;
   }
 
   const payload: SessionState = {
@@ -990,7 +1061,6 @@ function setActiveTab(id: string, options?: { preserveCurrent?: boolean }): void
   }
 
   editor.innerHTML = next.html;
-  newlineSelect.value = next.newline;
   renderTabs();
   renderStatus();
   editor.focus();
@@ -1022,7 +1092,6 @@ async function restoreSession(): Promise<void> {
       index: 0,
     });
     editor.innerHTML = initial.html;
-    newlineSelect.value = initial.newline;
     renderTabs();
     renderStatus();
     return;
@@ -1052,7 +1121,6 @@ async function restoreSession(): Promise<void> {
   const active = getActiveTab();
   if (active) {
     editor.innerHTML = active.html;
-    newlineSelect.value = active.newline;
   }
   renderTabs();
   renderStatus();
@@ -1138,7 +1206,6 @@ async function saveCurrentTab(forceSaveAs: boolean): Promise<boolean> {
   }
 
   active.html = normalizeEditorHtml(editor.innerHTML);
-  active.newline = newlineSelect.value as NewlineMode;
 
   const previousPath = active.path;
   let targetPath = previousPath;
@@ -1295,6 +1362,31 @@ function toggleStrike(): void {
   renderStatus();
 }
 
+function getSelectionStyleElement(): HTMLElement | null {
+  const selection = window.getSelection();
+  if (!selection?.anchorNode || !editor.contains(selection.anchorNode)) {
+    return null;
+  }
+
+  if (selection.anchorNode instanceof HTMLElement) {
+    return selection.anchorNode.closest<HTMLElement>("#editor *");
+  }
+  return selection.anchorNode.parentElement?.closest<HTMLElement>("#editor *") ?? null;
+}
+
+function syncTypingStyleFromSelection(): void {
+  const element = getSelectionStyleElement();
+  if (!element || isImageBlockElement(element.closest(".editor-image-block"))) {
+    return;
+  }
+
+  const computed = getComputedStyle(element);
+  currentTypingColor = toColorName(computed.color);
+  currentTypingBold = Number(computed.fontWeight) >= 600 || computed.fontWeight === "bold";
+  currentTypingStrike = computed.textDecorationLine.includes("line-through");
+  renderStatus();
+}
+
 function padDatePart(value: number): string {
   return String(value).padStart(2, "0");
 }
@@ -1316,9 +1408,18 @@ function insertTextAtSelection(text: string): void {
   markDirty();
 }
 
-function toggleShortcutSidebar(): void {
-  shortcutSidebarVisible = !shortcutSidebarVisible;
-  workspace.classList.toggle("shortcuts-hidden", !shortcutSidebarVisible);
+function setShortcutModalOpen(open: boolean): void {
+  shortcutModalOpen = open;
+  shortcutModal.hidden = !shortcutModalOpen;
+  if (shortcutModalOpen) {
+    shortcutClose.focus();
+  } else {
+    editor.focus();
+  }
+}
+
+function toggleShortcutModal(): void {
+  setShortcutModalOpen(!shortcutModalOpen);
 }
 
 function undo(): void {
@@ -1761,8 +1862,14 @@ document.querySelectorAll<HTMLButtonElement>(".color-btn").forEach((button) => {
   });
 });
 
-document.querySelector<HTMLButtonElement>(".style-btn")?.addEventListener("click", () => {
-  toggleBold();
+document.querySelectorAll<HTMLButtonElement>(".style-btn").forEach((button) => {
+  button.addEventListener("click", () => {
+    if (button.dataset.style === "bold") {
+      toggleBold();
+    } else if (button.dataset.style === "strike") {
+      toggleStrike();
+    }
+  });
 });
 
 tabstrip.addEventListener("click", (event) => {
@@ -1773,15 +1880,60 @@ tabstrip.addEventListener("click", (event) => {
   }
 });
 
-newlineSelect.addEventListener("change", () => {
+newlineButton.addEventListener("click", () => {
   const active = getActiveTab();
   if (!active) {
     return;
   }
-  active.newline = newlineSelect.value as NewlineMode;
+  active.newline = active.newline === "crlf" ? "lf" : "crlf";
   active.isDirty = true;
   renderTabs();
+  renderStatus();
   void persistSession();
+});
+
+shortcutToggle.addEventListener("click", () => {
+  toggleShortcutModal();
+});
+
+shortcutClose.addEventListener("click", () => {
+  setShortcutModalOpen(false);
+});
+
+shortcutModal.addEventListener("click", (event) => {
+  if (event.target === shortcutModal) {
+    setShortcutModalOpen(false);
+  }
+});
+
+statusPath.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+  openPathMenu(event.clientX, event.clientY);
+});
+
+statusPath.addEventListener("click", (event) => {
+  const rect = statusPath.getBoundingClientRect();
+  openPathMenu(rect.left, rect.top);
+  event.stopPropagation();
+});
+
+pathMenu.addEventListener("click", (event) => {
+  const target = event.target as HTMLElement;
+  const copyKind = target.dataset.copy;
+  const active = getActiveTab();
+  if (!copyKind || !active?.path) {
+    return;
+  }
+
+  const value = copyKind === "name" ? getFileNameFromPath(active.path) : active.path;
+  void writeClipboardText(value);
+  closePathMenu();
+});
+
+document.addEventListener("click", (event) => {
+  if (!pathMenu.hidden && event.target instanceof Node && !pathMenu.contains(event.target)) {
+    closePathMenu();
+  }
 });
 
 editor.addEventListener("input", () => {
@@ -1803,6 +1955,11 @@ editor.addEventListener("click", (event) => {
     return;
   }
   clearSelectedImageBlock();
+  syncTypingStyleFromSelection();
+});
+
+document.addEventListener("selectionchange", () => {
+  syncTypingStyleFromSelection();
 });
 
 document.addEventListener("mousedown", (event) => {
@@ -1879,7 +2036,7 @@ function handleShortcut(event: KeyboardEvent): void {
   }
   if (isShortcutToggle) {
     event.preventDefault();
-    toggleShortcutSidebar();
+    toggleShortcutModal();
     return;
   }
   if (key === "d") {
@@ -1909,6 +2066,11 @@ function handleShortcut(event: KeyboardEvent): void {
 }
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeFloatingUi();
+    return;
+  }
+
   if (handleIndentShortcut(event)) {
     return;
   }
